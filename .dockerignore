@@ -1,0 +1,62 @@
+# Virtual environments
+# Virtual environments
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Secrets — never bake into the image
+.env
+*.env
+
+# Dev / editor files
+.git/
+.gitignore
+.python-version
+uv.lock
+pyproject.toml
+*.md
+images/
+scripts/
+
+# IDE
+.vscode/
+.idea/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Secrets — never bake into the image
+.env
+*.env
+
+# Dev / editor files
+.git/
+.gitignore
+.python-version
+uv.lock
+pyproject.toml
+*.md
+images/
+scripts/
+
+# IDE
+.vscode/
+.idea/
