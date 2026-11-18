@@ -14,7 +14,7 @@ import uuid
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import HumanMessage
 
-AGENT_ORDER = ["flight_agent", "hotel_agent", "itinerary_agent", "final_agent"]
+TRAVEL_AGENTS = ["flight_agent", "hotel_agent", "itinerary_agent", "final_agent"]
 
 
 # =========================
@@ -22,7 +22,7 @@ AGENT_ORDER = ["flight_agent", "hotel_agent", "itinerary_agent", "final_agent"]
 # =========================
 
 app = FastAPI(
-    title="TripMate AI API",
+    title="Trip Planner AI API",
     description="LangGraph Multi-Agent Travel Planner API",
     version="1.0.0"
 )
@@ -78,6 +78,7 @@ async def travel_planner(request_data: TravelRequest):
             "success": True,
             "thread_id": result["thread_id"],
             "answer": result["answer"],
+            "route": result.get("route", "travel"),
             "flight_results": result["flight_results"],
             "hotel_results": result["hotel_results"],
             "itinerary": result["itinerary"],
@@ -221,36 +222,67 @@ def travel_stream(request_data: TravelRequest):  # plain `def`: FastAPI runs it 
         try:
             merged = {"flight_results": "", "hotel_results": "", "itinerary": "", "llm_calls": 0}
             answer = ""
+            route = "travel"  # default
 
-            yield _sse("agent_started", {"agent": AGENT_ORDER[0]})
+            # Start with the router
+            yield _sse("agent_started", {"agent": "router_agent"})
 
-            for chunk in travel_graph.stream(
+            for stream_mode, chunk in travel_graph.stream(
                 {
                     "messages": [HumanMessage(content=message)],
                     "user_query": message,
+                    "route": "",
                     "flight_results": "",
                     "hotel_results": "",
                     "itinerary": "",
                     "llm_calls": 0,
                 },
                 config=config,
-                stream_mode="updates",  # one chunk per finished node
+                stream_mode=["updates", "messages"],
             ):
-                for node, update in chunk.items():
-                    if node not in AGENT_ORDER:
-                        continue
-                    for key in merged:
-                        if key in update:
-                            merged[key] = update[key]
-                    if node == "final_agent":
-                        answer = update["messages"][-1].content
+                # ── Node-completion events ──
+                if stream_mode == "updates":
+                    for node, update in chunk.items():
 
-                    yield _sse("agent_done", {"agent": node})
-                    nxt = AGENT_ORDER.index(node) + 1
-                    if nxt < len(AGENT_ORDER):
-                        yield _sse("agent_started", {"agent": AGENT_ORDER[nxt]})
+                        # Router finished — emit route decision
+                        if node == "router_agent":
+                            route = update.get("route", "travel")
+                            yield _sse("agent_done", {"agent": "router_agent"})
+                            yield _sse("route", {"route": route})
+                            if route == "travel":
+                                yield _sse("agent_started", {"agent": TRAVEL_AGENTS[0]})
+                            elif route == "chat":
+                                yield _sse("agent_started", {"agent": "chat_agent"})
+                            continue
 
-            yield _sse("result", {"thread_id": thread_id, "answer": answer, **merged})
+                        # Chat agent finished
+                        if node == "chat_agent":
+                            answer = update["messages"][-1].content
+                            yield _sse("agent_done", {"agent": "chat_agent"})
+                            continue
+
+                        # Travel pipeline agents
+                        if node in TRAVEL_AGENTS:
+                            for key in merged:
+                                if key in update:
+                                    merged[key] = update[key]
+                            if node == "final_agent":
+                                answer = update["messages"][-1].content
+
+                            yield _sse("agent_done", {"agent": node})
+                            nxt = TRAVEL_AGENTS.index(node) + 1
+                            if nxt < len(TRAVEL_AGENTS):
+                                yield _sse("agent_started", {"agent": TRAVEL_AGENTS[nxt]})
+
+                # ── Token-level streaming from LLM ──
+                elif stream_mode == "messages":
+                    msg_chunk, metadata = chunk
+                    node_name = metadata.get("langgraph_node", "")
+                    # Stream tokens from both final_agent and chat_agent
+                    if node_name in ("final_agent", "chat_agent") and hasattr(msg_chunk, "content") and msg_chunk.content:
+                        yield _sse("token", {"text": msg_chunk.content})
+
+            yield _sse("result", {"thread_id": thread_id, "answer": answer, "route": route, **merged})
 
         except Exception:
             traceback.print_exc()

@@ -8,6 +8,7 @@ pg-admin to see the data base tables in postgressSQL
 for testing:
 1. uv run python -m scripts.tavily_tool_test
 2. uv run python -m scripts.flight_tool_test.py
+3. uv run python -m scripts.build_graph
 
 
 ## Creating tools in files:

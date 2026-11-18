@@ -64,10 +64,70 @@ my_llm = ChatGroq(
 class TravelState(TypedDict):
     messages: Annotated[list[AnyMessage], operator.add]
     user_query: str
+    route: str              # "chat" or "travel" — set by router_agent
     flight_results: str
     hotel_results: str
     itinerary: str
     llm_calls: int
+
+
+# =========================
+# Router Agent — classifies intent
+# =========================
+
+ROUTER_PROMPT = (
+    "You are a router. If the user is asking about travel planning, booking flights, "
+    "hotels, itinerary, trips, destinations, or anything travel-related, respond with "
+    "exactly: travel\n"
+    "For everything else (greetings, chitchat, questions about you, general questions, "
+    "etc.), respond with exactly: chat\n"
+    "Reply with ONLY one word: travel or chat"
+)
+
+def router_agent(state: TravelState):
+    query = state["user_query"]
+    response = my_llm.invoke([
+        SystemMessage(content=ROUTER_PROMPT),
+        HumanMessage(content=query),
+    ])
+    route = response.content.strip().lower()
+    # Normalize — anything not exactly "chat" defaults to "travel"
+    if route not in ("chat", "travel"):
+        route = "travel" if any(w in query.lower() for w in
+            ["trip", "flight", "hotel", "travel", "book", "itinerary", "destination",
+             "fly", "stay", "vacation", "tour", "airport", "airline"]) else "chat"
+
+    return {
+        "route": route,
+        "messages": [AIMessage(content=f"[Router → {route}]")],
+        "llm_calls": state.get("llm_calls", 0) + 1,
+    }
+
+
+def route_decision(state: TravelState):
+    return state.get("route", "travel")
+
+
+# =========================
+# Chat Agent — casual conversation
+# =========================
+
+CHAT_SYSTEM = (
+    "You are Trip Planner, a friendly AI travel planning assistant. "
+    "The user is chatting casually. Respond warmly and helpfully. "
+    "If they ask about travel, tell them you can help plan trips — just describe "
+    "where they want to go, their budget, and how many days. Keep responses concise."
+)
+
+def chat_agent(state: TravelState):
+    response = my_llm.invoke([
+        SystemMessage(content=CHAT_SYSTEM),
+        HumanMessage(content=state["user_query"]),
+    ])
+    return {
+        "messages": [response],
+        "llm_calls": state.get("llm_calls", 0) + 1,
+    }
 
 
 # =========================
@@ -108,24 +168,34 @@ def hotel_agent(state: TravelState):
 # Itinerary Agent
 # =========================
 
+def _truncate(text: str, max_chars: int = 1500) -> str:
+    """Keep text under max_chars to avoid Groq TPM limits."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n… (truncated)"
+
+
 def itinerary_agent(state: TravelState):
-    prompt = f"""
-Create a complete travel itinerary.
+    flights = _truncate(state['flight_results'], 1200)
+    hotels  = _truncate(state['hotel_results'],  1200)
+
+    prompt = f"""\
+Create a concise travel itinerary.
 
 User Query:
 {state['user_query']}
 
 Flight Results:
-{state['flight_results']}
+{flights}
 
 Hotel Results:
-{state['hotel_results']}
+{hotels}
 
-Make the itinerary practical, budget-aware, and easy to follow.
+Make the itinerary practical, budget-aware, and easy to follow. Keep it concise.
 """
 
     response = my_llm.invoke([
-        SystemMessage(content="You are an expert travel planner."),
+        SystemMessage(content="You are an expert travel planner. Keep your response concise."),
         HumanMessage(content=prompt)
     ])
 
@@ -139,21 +209,26 @@ Make the itinerary practical, budget-aware, and easy to follow.
 # Final Response Agent
 # =========================
 
+
 def final_agent(state: TravelState):
-    final_prompt = f"""
+    flights  = _truncate(state['flight_results'],  1200)
+    hotels   = _truncate(state['hotel_results'],   1200)
+    itinerary = _truncate(state['itinerary'],      2000)
+
+    final_prompt = f"""\
 Generate the final travel response for the user.
 
 User Request:
 {state['user_query']}
 
 Flights:
-{state['flight_results']}
+{flights}
 
 Hotels:
-{state['hotel_results']}
+{hotels}
 
 Itinerary:
-{state['itinerary']}
+{itinerary}
 
 Format the final answer beautifully using these sections:
 
@@ -166,12 +241,13 @@ Format the final answer beautifully using these sections:
 
 Important:
 - Be clear and practical.
+- Be concise — keep each section focused.
 - Mention that live flight API may not provide ticket prices if pricing is unavailable.
 - Keep the response useful for real travel planning.
 """
 
     response = my_llm.invoke([
-        SystemMessage(content="You are a professional AI travel booking assistant."),
+        SystemMessage(content="You are a professional AI travel booking assistant. Keep your response concise and well-structured."),
         HumanMessage(content=final_prompt)
     ])
 
@@ -187,16 +263,28 @@ Important:
 
 graph = StateGraph(TravelState)
 
+graph.add_node("router_agent", router_agent)
+graph.add_node("chat_agent", chat_agent)
 graph.add_node("flight_agent", flight_agent)
 graph.add_node("hotel_agent", hotel_agent)
 graph.add_node("itinerary_agent", itinerary_agent)
 graph.add_node("final_agent", final_agent)
 
-graph.add_edge(START, "flight_agent")
+# Router decides the path
+graph.add_edge(START, "router_agent")
+graph.add_conditional_edges("router_agent", route_decision, {
+    "travel": "flight_agent",
+    "chat": "chat_agent",
+})
+
+# Travel pipeline
 graph.add_edge("flight_agent", "hotel_agent")
 graph.add_edge("hotel_agent", "itinerary_agent")
 graph.add_edge("itinerary_agent", "final_agent")
 graph.add_edge("final_agent", END)
+
+# Chat exits directly
+graph.add_edge("chat_agent", END)
 
 
 # =========================
@@ -236,6 +324,7 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
                 HumanMessage(content=user_input)
             ],
             "user_query": user_input,
+            "route": "",
             "flight_results": "",
             "hotel_results": "",
             "itinerary": "",
@@ -249,6 +338,7 @@ def run_travel_agent(user_input: str, thread_id: str | None = None):
     return {
         "thread_id": thread_id,
         "answer": final_answer,
+        "route": result.get("route", "travel"),
         "flight_results": result.get("flight_results", ""),
         "hotel_results": result.get("hotel_results", ""),
         "itinerary": result.get("itinerary", ""),
